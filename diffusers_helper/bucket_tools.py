@@ -14,11 +14,13 @@ bucket_options = {
         (832, 480),
         (864, 448),
         (960, 416),
+        (512, 960)
     ],
 }
 
 
 def find_nearest_bucket(h, w, resolution=640):
+    print(f'H and W: {h} and {w}')
     min_metric = float('inf')
     best_bucket = None
     for (bucket_h, bucket_w) in bucket_options[resolution]:
@@ -26,5 +28,6 @@ def find_nearest_bucket(h, w, resolution=640):
         if metric <= min_metric:
             min_metric = metric
             best_bucket = (bucket_h, bucket_w)
+    print(best_bucket)
     return best_bucket
 
