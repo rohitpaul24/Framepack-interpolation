@@ -106,7 +106,7 @@ stream = MockStream()
 # we paste the worker logic here to ensure it uses OUR stream.
 
 @torch.no_grad()
-def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
+def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
     # [Insert the full worker code from your provided snippet here]
     # For brevity in this answer, I assume the 'worker' function logic is available 
     # either by pasting the function body here or if this script is appended to the original file.
@@ -138,21 +138,40 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
         llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
 
-        # Image Processing
+        # Image Processing (start frame)
         H, W, C = input_image.shape
         height, width = find_nearest_bucket(H, W, resolution=640)
         input_image_np = resize_and_center_crop(input_image, target_width=width, target_height=height)
         input_image_pt = torch.from_numpy(input_image_np).float() / 127.5 - 1
         input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None]
+        
+        # Processing end image (if provided)
+        has_end_image = end_image is not None
+        if has_end_image:
+            H_end, W_end, C_end = end_image.shape
+            end_image_np = resize_and_center_crop(end_image, target_width=width, target_height=height)
+            end_image_pt = torch.from_numpy(end_image_np).float() / 127.5 - 1
+            end_image_pt = end_image_pt.permute(2, 0, 1)[None, :, None]
 
         # VAE
         if not high_vram: load_model_as_complete(vae, target_device=gpu)
         start_latent = vae_encode(input_image_pt, vae)
+        
+        if has_end_image:
+            end_latent = vae_encode(end_image_pt, vae)
 
         # CLIP Vision
         if not high_vram: load_model_as_complete(image_encoder, target_device=gpu)
         image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
-        image_encoder_last_hidden_state = image_encoder_output.last_hidden_state.to(transformer.dtype)
+        image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
+        
+        if has_end_image:
+            end_image_encoder_output = hf_clip_vision_encode(end_image_np, feature_extractor, image_encoder)
+            end_image_encoder_last_hidden_state = end_image_encoder_output.last_hidden_state
+            # Combine both image embeddings or use a weighted approach
+            image_encoder_last_hidden_state = (image_encoder_last_hidden_state + end_image_encoder_last_hidden_state) / 2
+        
+        image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(transformer.dtype)
         
         # Casting
         llama_vec = llama_vec.to(transformer.dtype)
@@ -166,12 +185,13 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, height // 8, width // 8), dtype=torch.float32).cpu()
         history_pixels = None
         total_generated_latent_frames = 0
-        latent_paddings = reversed(range(total_latent_sections))
+        latent_paddings = list(reversed(range(total_latent_sections)))
         if total_latent_sections > 4:
             latent_paddings = [3] + [2] * (total_latent_sections - 3) + [1, 0]
 
         for latent_padding in latent_paddings:
             is_last_section = latent_padding == 0
+            is_first_section = latent_padding == latent_paddings[0]
             latent_padding_size = latent_padding * latent_window_size
 
             indices = torch.arange(0, sum([1, latent_padding_size, latent_window_size, 1, 2, 16])).unsqueeze(0)
@@ -181,6 +201,11 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             clean_latents_pre = start_latent.to(history_latents)
             clean_latents_post, clean_latents_2x, clean_latents_4x = history_latents[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
             clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
+            
+            # Use end image latent for the first section if provided
+            if has_end_image and is_first_section:
+                clean_latents_post = end_latent.to(history_latents)
+                clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
 
             if not high_vram:
                 unload_complete_models()
@@ -290,9 +315,10 @@ def create_looped_video(input_video_path):
     use_teacache = True
     mp4_crf = 16
 
-    # Call Worker
+    # Call Worker with first frame as end_image to create seamless loop
     worker(
-        input_image=last_frame_rgb, # Last frame becomes Start of new video
+        input_image=last_frame_rgb,  # Last frame becomes Start of new video
+        end_image=first_frame_rgb,   # First frame becomes End target for seamless loop
         prompt=prompt,
         n_prompt=n_prompt,
         seed=seed,
@@ -348,7 +374,7 @@ def create_looped_video(input_video_path):
 
 if __name__ == "__main__":
     # REPLACE THIS WITH YOUR VIDEO PATH
-    input_video = "out_new_angry_1.mp4" 
+    input_video = "angry_clip.mp4" 
     
     if os.path.exists(input_video):
         create_looped_video(input_video)
