@@ -261,7 +261,271 @@ def worker(input_image, end_image, prompt, n_prompt, seed, total_second_length, 
 
 
 # ==============================================================================
-#  PART 3: Video Extraction and Loop Logic
+#  PART 3: Utility Functions for Multi-Second Loop Generation
+# ==============================================================================
+
+def extract_frame_at_timestamp(video_path, timestamp_sec):
+    """
+    Extract a single frame at a specific timestamp from a video.
+    
+    Args:
+        video_path: Path to input video
+        timestamp_sec: Timestamp in seconds
+        
+    Returns:
+        tuple: (frame_rgb, height, width)
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video: {video_path}")
+    
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_number = int(timestamp_sec * fps)
+    
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+    ret, frame_bgr = cap.read()
+    cap.release()
+    
+    if not ret:
+        raise ValueError(f"Could not read frame at {timestamp_sec}s")
+    
+    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    height, width = frame_rgb.shape[:2]
+    
+    return frame_rgb, height, width
+
+
+def generate_interpolation_loop(start_frame, end_frame, output_path, config):
+    """
+    Generate interpolation video from start_frame to end_frame.
+    
+    Args:
+        start_frame: Starting frame (numpy array)
+        end_frame: Ending frame (numpy array)
+        output_path: Path to save interpolation video
+        config: Dictionary with generation parameters
+        
+    Returns:
+        str: Path to generated interpolation video
+    """
+    print(f"  Generating interpolation: {os.path.basename(output_path)}")
+    
+    # Call worker function
+    worker(
+        input_image=start_frame,
+        end_image=end_frame,
+        prompt=config.get('prompt', 'smooth transition'),
+        n_prompt=config.get('n_prompt', ''),
+        seed=config.get('seed', 42),
+        total_second_length=config.get('total_second_length', 1.0),
+        latent_window_size=config.get('latent_window_size', 9),
+        steps=config.get('steps', 25),
+        cfg=config.get('cfg', 1.0),
+        gs=config.get('gs', 10.0),
+        rs=config.get('rs', 0.0),
+        gpu_memory_preservation=config.get('gpu_memory_preservation', 6.0),
+        use_teacache=config.get('use_teacache', True),
+        mp4_crf=config.get('mp4_crf', 16)
+    )
+    
+    # Get generated file from stream
+    generated_path = stream.output_queue.last_file
+    if not generated_path:
+        raise ValueError("Interpolation generation failed")
+    
+    # Move to desired output path
+    if generated_path != output_path:
+        shutil.move(generated_path, output_path)
+    
+    return output_path
+
+
+def trim_video_to_timestamp(input_video, output_path, end_timestamp, fps):
+    """
+    Trim video from start to just before the specified timestamp.
+    Excludes the last frame to avoid duplication when concatenating with interpolation.
+    
+    Args:
+        input_video: Path to input video
+        output_path: Path to save trimmed video
+        end_timestamp: End time in seconds
+        fps: Frames per second of the video
+        
+    Returns:
+        str: Path to trimmed video
+    """
+    print(f"  Trimming video to {end_timestamp}s: {os.path.basename(output_path)}")
+    
+    # Calculate the exact time to trim to (exclude the last frame)
+    # Subtract one frame duration to avoid including the frame at end_timestamp
+    frame_duration = 1.0 / fps
+    trim_time = end_timestamp - frame_duration
+    
+    cmd = [
+        "ffmpeg", "-y", "-i", input_video,
+        "-t", str(trim_time),  # Trim to just before end_timestamp
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",  # Re-encode for precise frame control
+        output_path
+    ]
+    
+    subprocess.run(cmd, capture_output=True)
+    return output_path
+
+
+def concatenate_videos(video1_path, video2_path, output_path):
+    """
+    Concatenate two videos.
+    
+    Args:
+        video1_path: Path to first video
+        video2_path: Path to second video
+        output_path: Path to save concatenated video
+        
+    Returns:
+        str: Path to concatenated video
+    """
+    print(f"  Concatenating videos: {os.path.basename(output_path)}")
+    
+    # Create temporary list file
+    list_file = "concat_list.txt"
+    with open(list_file, "w") as f:
+        f.write(f"file '{os.path.abspath(video1_path)}'\n")
+        f.write(f"file '{os.path.abspath(video2_path)}'\n")
+    
+    cmd = [
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        "-i", list_file,
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        output_path
+    ]
+    
+    subprocess.run(cmd, capture_output=True)
+    
+    if os.path.exists(list_file):
+        os.remove(list_file)
+    
+    return output_path
+
+
+def process_video_multi_loops(input_video_path):
+    """
+    Main function to process video and create loops at each second mark.
+    
+    For a 5-second video, creates:
+    - Interpolations: 1sec→0sec, 2sec→0sec, 3sec→0sec, 4sec→0sec
+    - Loopable videos: [0-1sec]+loop, [0-2sec]+loop, [0-3sec]+loop, [0-4sec]+loop
+    
+    Args:
+        input_video_path: Path to input video
+    """
+    print(f"\n{'='*80}")
+    print(f"Processing Video: {input_video_path}")
+    print(f"{'='*80}\n")
+    
+    # Get video info
+    cap = cv2.VideoCapture(input_video_path)
+    if not cap.isOpened():
+        print("Error: Could not open video.")
+        return
+    
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = frame_count / fps
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    
+    print(f"Video Info:")
+    print(f"  Duration: {duration:.2f}s")
+    print(f"  Resolution: {width}x{height}")
+    print(f"  FPS: {fps:.2f}")
+    print(f"  Total Frames: {frame_count}\n")
+    
+    # Calculate number of second marks
+    num_seconds = int(duration)
+    if num_seconds < 1:
+        print("Error: Video must be at least 1 second long.")
+        return
+    
+    # Create output folders
+    video_name = os.path.splitext(os.path.basename(input_video_path))[0]
+    interpolations_folder = os.path.join(outputs_folder, 'interpolations', video_name)
+    loopable_folder = os.path.join(outputs_folder, 'loopable_videos', video_name)
+    trimmed_folder = os.path.join(outputs_folder, 'trimmed_videos', video_name)
+    
+    os.makedirs(interpolations_folder, exist_ok=True)
+    os.makedirs(loopable_folder, exist_ok=True)
+    os.makedirs(trimmed_folder, exist_ok=True)
+    
+    print(f"Output folders created:")
+    print(f"  Interpolations: {interpolations_folder}")
+    print(f"  Loopable videos: {loopable_folder}")
+    print(f"  Trimmed videos: {trimmed_folder}\n")
+    
+    # Extract frame at 0 seconds (reference frame)
+    print("Extracting reference frame at 0s...")
+    frame_0sec, _, _ = extract_frame_at_timestamp(input_video_path, 0)
+    
+    # Configuration for interpolation generation
+    config = {
+        'prompt': 'smooth transition',
+        'n_prompt': '',
+        'seed': 42,
+        'total_second_length': 1.0,
+        'latent_window_size': 9,
+        'steps': 25,
+        'cfg': 1.0,
+        'gs': 10.0,
+        'rs': 0.0,
+        'gpu_memory_preservation': 6.0,
+        'use_teacache': True,
+        'mp4_crf': 16
+    }
+    
+    # Process each second mark
+    for sec in range(1, num_seconds):
+        print(f"\n{'-'*80}")
+        print(f"Processing {sec}s mark ({sec}/{num_seconds-1})")
+        print(f"{'-'*80}")
+        
+        # Extract frame at this second
+        print(f"Extracting frame at {sec}s...")
+        frame_at_sec, _, _ = extract_frame_at_timestamp(input_video_path, sec)
+        
+        # Generate interpolation from this second back to 0
+        interpolation_path = os.path.join(
+            interpolations_folder, 
+            f"{video_name}_loop_{sec}sec_to_0sec.mp4"
+        )
+        generate_interpolation_loop(frame_at_sec, frame_0sec, interpolation_path, config)
+        
+        # Trim original video to this second
+        trimmed_path = os.path.join(
+            trimmed_folder,
+            f"{video_name}_trimmed_{sec}sec.mp4"
+        )
+        trim_video_to_timestamp(input_video_path, trimmed_path, sec, fps)
+        
+        # Concatenate trimmed + interpolation
+        loopable_path = os.path.join(
+            loopable_folder,
+            f"{video_name}_loopable_{sec}sec.mp4"
+        )
+        concatenate_videos(trimmed_path, interpolation_path, loopable_path)
+        
+        print(f"✓ Completed {sec}s mark")
+    
+    print(f"\n{'='*80}")
+    print(f"SUCCESS! Generated {num_seconds-1} loopable videos")
+    print(f"{'='*80}")
+    print(f"\nOutput locations:")
+    print(f"  Interpolations: {interpolations_folder}")
+    print(f"  Loopable videos: {loopable_folder}")
+    print(f"  Trimmed videos: {trimmed_folder}\n")
+
+
+# ==============================================================================
+#  PART 4: Legacy Function (kept for reference)
 # ==============================================================================
 
 def create_looped_video(input_video_path):
@@ -302,8 +566,8 @@ def create_looped_video(input_video_path):
     print("Generating bridge video from Last Frame...")
     
     # Configuration
-    prompt = "smooth transition" # Minimal prompt to encourage motion
-    n_prompt = ""
+    prompt = "silent lips, mouth shut, static tripod shot" # Minimal prompt to encourage motion
+    n_prompt = "talking"
     seed = 42
     total_second_length = 1.0 # Shorter length for the bridge
     latent_window_size = 9
@@ -374,9 +638,14 @@ def create_looped_video(input_video_path):
 
 if __name__ == "__main__":
     # REPLACE THIS WITH YOUR VIDEO PATH
-    input_video = "angry_clip.mp4" 
+    input_video = "test_vid.mp4" 
     
     if os.path.exists(input_video):
-        create_looped_video(input_video)
+        # Use the new multi-second loop generation
+        process_video_multi_loops(input_video)
+        
+        # To use the legacy single-loop function, uncomment below:
+        # create_looped_video(input_video)
     else:
+        print(f"Error: Video file not found: {input_video}")
         print("Please set a valid input_video path at the bottom of the script.")

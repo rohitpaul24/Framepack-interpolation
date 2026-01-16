@@ -88,6 +88,95 @@ def resize_without_crop(image, target_width, target_height):
     return np.array(resized_image)
 
 
+def resize_and_pad(image, target_width, target_height):
+    """
+    Resize image to fit inside target dimensions and pad to exact size.
+    Returns padded image and padding info for later removal.
+    
+    Args:
+        image: Input image (H, W, C)
+        target_width: Target width
+        target_height: Target height
+    
+    Returns:
+        padded_image: Image padded to target size
+        pad_info: Dict with padding information for removal
+    """
+    h, w = image.shape[:2]
+    
+    # If already exact size, no padding needed
+    if h == target_height and w == target_width:
+        return image, {'pad_top': 0, 'pad_bottom': 0, 'pad_left': 0, 'pad_right': 0, 'new_h': h, 'new_w': w}
+    
+    # Calculate scale to fit inside target (maintain aspect ratio)
+    scale = min(target_width / w, target_height / h)
+    new_w = int(round(w * scale))
+    new_h = int(round(h * scale))
+    
+    # Resize image
+    pil_image = Image.fromarray(image)
+    resized_image = pil_image.resize((new_w, new_h), Image.LANCZOS)
+    resized_np = np.array(resized_image)
+    
+    # Calculate padding
+    pad_w = target_width - new_w
+    pad_h = target_height - new_h
+    pad_left = pad_w // 2
+    pad_right = pad_w - pad_left
+    pad_top = pad_h // 2
+    pad_bottom = pad_h - pad_top
+    
+    # Pad image (black padding)
+    padded = np.pad(
+        resized_np,
+        ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)),
+        mode='constant',
+        constant_values=0
+    )
+    
+    # Store padding info for later removal
+    pad_info = {
+        'pad_top': pad_top,
+        'pad_bottom': pad_bottom,
+        'pad_left': pad_left,
+        'pad_right': pad_right,
+        'new_h': new_h,
+        'new_w': new_w
+    }
+    
+    return padded, pad_info
+
+
+def remove_padding(image, pad_info):
+    """
+    Remove padding from image using stored padding info.
+    
+    Args:
+        image: Padded image (H, W, C)
+        pad_info: Padding information from resize_and_pad
+    
+    Returns:
+        Cropped image without padding
+    """
+    pad_top = pad_info['pad_top']
+    pad_bottom = pad_info['pad_bottom']
+    pad_left = pad_info['pad_left']
+    pad_right = pad_info['pad_right']
+    
+    h, w = image.shape[:2]
+    
+    # Calculate crop boundaries
+    top = pad_top
+    bottom = h - pad_bottom if pad_bottom > 0 else h
+    left = pad_left
+    right = w - pad_right if pad_right > 0 else w
+    
+    # Crop padding
+    cropped = image[top:bottom, left:right]
+    
+    return cropped
+
+
 def just_crop(image, w, h):
     if h == image.shape[0] and w == image.shape[1]:
         return image
